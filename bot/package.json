@@ -1,0 +1,13 @@
+{
+  "name": "qqai-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "QQ 群 AI 自由发言机器人(OneBot 11 + DeepSeek)",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/index.mjs"
+  }
+}
