@@ -2,7 +2,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { log } from './config.mjs';
-import { fetchSearchContext } from './llm.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, '..', 'data');
@@ -16,6 +15,35 @@ const INCOMPLETE_RE = /(…|\.\.\.|待续|未完|下回|下次再说|先写这�
 
 /** 纯客套/预告话(没有实际内容) */
 const STALL_RE = /^(好的?|好嘞|收到|嗯|稍等|等(我|一下)|让我|我来|我先|可以|行|没问题|OK|ok)[，。!！~～\s]*$/;
+
+/** 把回复清洗成适合 QQ 群消息的纯文本(QQ 不渲染 Markdown) */
+function cleanReplyText(text) {
+  let t = String(text)
+    // 代码块:去掉围栏但保留代码内容
+    .replace(/```[\s\S]*?```/g, (m) => {
+      const inner = m.replace(/^```.*$/gm, '').trim();
+      return inner ? '\n' + inner + '\n' : '';
+    })
+    // 行内代码
+    .replace(/`([^`]*)`/g, '$1')
+    // 标题符
+    .replace(/^#{1,6}\s*/gm, '')
+    // 加粗/斜体
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    // 引用
+    .replace(/^\s*>\s?/gm, '')
+    // 列表符 → ·
+    .replace(/^\s*[-*+]\s+/gm, '· ')
+    // 占位符 ××、某某
+    .replace(/[×✕✖][×✕✖]+/g, '……')
+    // 动作/表情描述(全角括号包裹的短句)
+    .replace(/[（(][^（）()]{1,14}[)）]/g, '')
+    // 多余空行
+    .replace(/\n{2,}/g, '\n')
+    .trim();
+  return t;
+}
 
 /**
  * 大脑:每个群一个会话,维护上下文、决定何时发言、控制频率
@@ -47,7 +75,7 @@ export function createBrain(config, llm, api) {
         .readFileSync(histFile(s.groupId), 'utf8')
         .split('\n')
         .filter(Boolean);
-      for (const line of lines.slice(-100)) {
+      for (const line of lines.slice(-config.behavior.historySize)) {
         const h = JSON.parse(line);
         if (h && h.content) s.history.push({ role: h.role, name: h.name, content: h.content });
       }
@@ -240,17 +268,23 @@ export function createBrain(config, llm, api) {
       : '';
 
     try {
-      // 提问/技术问题 → 先联网搜资料,注入上下文
-      let searchCtx = '';
-      if (isTech || reason === 'question' || reason === 'probe') {
-        searchCtx = await fetchSearchContext(ev.text, config);
-        if (searchCtx) log(`[群${s.groupId}] 已获取联网资料(${searchCtx.length}字)`);
-      }
-
       log(`[trace][群${s.groupId}] 开始生成回复 reason=${reason} 历史${s.history.length}条`);
-      let reply = await llm.chat(buildMessages(s), {
-        extraSystem: extra + techHint + searchCtx,
+      const msgs = buildMessages(s);
+      // 时间类问题:把准确时间钉进最后一条消息(模型对最后消息服从度最高),并提示可用工具
+      let timeDirective = '';
+      if (/几点|几点了|现在时间|当前时间|什么时间|日期|几月几号|星期几|今天周几|今天几号|什么日子/.test(ev.text)) {
+        const now = new Date();
+        const week = ['日', '一', '二', '三', '四', '五', '六'][now.getDay()];
+        const pad = (n) => String(n).padStart(2, '0');
+        const t = `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日 ${pad(now.getHours())}:${pad(now.getMinutes())} 星期${week}`;
+        timeDirective = `\n重要:现在是北京时间 ${t}。对方在问时间/日期,直接按这个时间回答,不要推算、不要使用内部时钟。`;
+        msgs[msgs.length - 1].content += timeDirective;
+      }
+      // 对方直接跟机器人说话时,AI 可自主决定调用工具(搜索/天气/时间)
+      let reply = await llm.chat(msgs, {
+        extraSystem: extra + techHint,
         maxTokens: isTech ? 1500 : undefined,
+        tools: addressed,
       });
       log(`[trace][群${s.groupId}] LLM完成: ${reply.slice(0, 40)}`);
       // 完整解答校验:技术问题若只发了客套话/预告,或明显没写完,重新生成
@@ -265,9 +299,9 @@ export function createBrain(config, llm, api) {
           extraSystem:
             extra +
             techHint +
-            searchCtx +
             `\n注意:你刚才只发了客套话或预告,没有给出解答。请把完整解答一次性发完,开头直接进入正题。`,
           maxTokens: 1500,
+          tools: addressed,
         });
       }
       await sendReply(s, ev, reply, true);
@@ -298,6 +332,18 @@ export function createBrain(config, llm, api) {
     // 附上群信息(如有)
     if (s.groupName) sys.push(`当前群:「${s.groupName}」`);
     if (selfId) sys.push(`你是 ${config.botName},你的QQ号是 ${selfId}。`);
+    // 当前时间(北京时间)
+    const now = new Date();
+    const week = ['日', '一', '二', '三', '四', '五', '六'][now.getDay()];
+    const pad = (n) => String(n).padStart(2, '0');
+    sys.push(
+      `现在是 ${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日 ` +
+        `${pad(now.getHours())}:${pad(now.getMinutes())} 星期${week}(北京时间),问时间/日期/星期就按这个回答。`
+    );
+    sys.push(
+      '你有工具可用:web_search(联网搜索资料)、get_weather(查天气)、get_current_time(获取准确时间)。' +
+        '当问题涉及实时信息(时间、日期、天气、最新新闻、教程资料等)时,必须主动调用对应工具,根据工具返回的结果回答,不要凭内部知识或内部时钟作答。'
+    );
     sys.push('以下是最近聊天记录(每条前面是说话人):');
 
     const msgs = [
@@ -321,7 +367,7 @@ export function createBrain(config, llm, api) {
   }
 
   async function sendReply(s, ev, text, withAt = true) {
-    const clean = text.replace(/\n{2,}/g, '\n').trim();
+    const clean = cleanReplyText(text);
     // 回复时 @ 目标(主动发言或 @ 自己除外)
     const shouldAt = withAt && ev.user_id && String(ev.user_id) !== String(selfId);
     const message = shouldAt
