@@ -53,17 +53,13 @@ function connect() {
     reconnectDelay = 3000;
   };
   ws.onmessage = (ev) => {
-    try {
-      handle(JSON.parse(ev.data));
-    } catch (e) {
-      log(`[网关] 解析消息失败: ${e.message}`);
-    }
+    handle(JSON.parse(ev.data)).catch((e) => log(`[网关] 处理消息失败: ${e.message}`));
   };
   ws.onclose = () => scheduleReconnect();
   ws.onerror = () => scheduleReconnect();
 }
 
-function handle(msg) {
+async function handle(msg) {
   if (msg.echo && pending.has(msg.echo)) {
     const p = pending.get(msg.echo);
     pending.delete(msg.echo);
@@ -90,6 +86,10 @@ function handle(msg) {
       if (!mentions.includes(String(selfId))) return;
       log(`[网关] (自己@自己)`);
     }
+    const images = (msg.message || [])
+      .filter((s) => s.type === 'image')
+      .map((s) => s.data?.file || s.data?.url)
+      .filter(Boolean);
     const ev = {
       id: nextEventId++,
       type: 'group_message',
@@ -98,9 +98,31 @@ function handle(msg) {
       sender: msg.sender || {},
       text,
       mentions,
+      images,
       raw: msg.message,
       time: msg.time,
     };
+    // 引用消息:先解析被引用的图片(如图片在引用里而不是本条消息),再推送
+    if (!images.length && Array.isArray(msg.message)) {
+      const replyIds = msg.message
+        .filter((s) => s.type === 'reply' && s.data?.id)
+        .map((s) => s.data.id);
+      for (const rid of replyIds.slice(0, 2)) {
+        try {
+          const m = await call('get_msg', { message_id: rid });
+          const imgs = (m?.message || [])
+            .filter((s) => s.type === 'image')
+            .map((s) => s.data?.file || s.data?.url)
+            .filter(Boolean);
+          if (imgs.length) {
+            ev.images.push(...imgs);
+            log(`[网关] 引用解析到 ${imgs.length} 张图片(消息#${ev.id})`);
+          }
+        } catch {
+          /* 引用解析失败,忽略 */
+        }
+      }
+    }
     pushEvent(ev);
     log(`[网关] 转发[群${groupId}] ${msg.sender?.card || msg.sender?.nickname || msg.user_id}: ${text.slice(0, 40)}`);
     return;
@@ -181,6 +203,37 @@ const server = http.createServer(async (req, res) => {
     // 健康检查
     if (req.method === 'GET' && url.pathname === '/health') {
       res.end(JSON.stringify({ ok: true, selfId: selfId ? String(selfId) : null, wsConnected: !!ws && ws.readyState === WebSocket.OPEN }));
+      return;
+    }
+
+    // 登录状态检查(真实网络探测:get_group_list 需要真实在线通道,本地缓存不可信)
+    if (req.method === 'GET' && url.pathname === '/login') {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        res.end(JSON.stringify({ ok: false, error: '未连接 NapCat' }));
+        return;
+      }
+      try {
+        const data = await call('get_group_list', {});
+        res.end(JSON.stringify({ ok: true, groups: (data || []).length }));
+      } catch (e) {
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+      return;
+    }
+
+    // 通用 OneBot API 代理(供反应模块调用 get_image 等)
+    if (req.method === 'POST' && url.pathname === '/api') {
+      const body = await getBody(req);
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        res.end(JSON.stringify({ ok: false, error: '未连接 NapCat' }));
+        return;
+      }
+      try {
+        const data = await call(body.action, body.params || {});
+        res.end(JSON.stringify({ ok: true, data }));
+      } catch (e) {
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
       return;
     }
 

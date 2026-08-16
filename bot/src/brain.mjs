@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { log } from './config.mjs';
+import { downloadImage, describeImage } from './vlm.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, '..', 'data');
@@ -268,8 +269,28 @@ export function createBrain(config, llm, api) {
       : '';
 
     try {
+      // 被@且带图片 → 下载并让本地视觉模型识别,描述注入上下文
+      let visionCtx = '';
+      if (addressed && ev.images?.length) {
+        log(`[群${s.groupId}] 收到图片标识: ${JSON.stringify(ev.images)}`);
+        const descs = [];
+        for (const imgFile of ev.images.slice(0, 3)) {
+          const localPath = await downloadImage(api.call, imgFile);
+          log(`[群${s.groupId}] 图片下载结果: ${localPath || '失败'}`);
+          if (!localPath) continue;
+          const desc = await describeImage(localPath, '请用中文详细描述这张图片的内容,包括文字、物体、场景等。');
+          if (desc) descs.push(desc);
+        }
+        if (descs.length) {
+          visionCtx = `\n对方发来了图片,图片内容(本地视觉模型识别结果,必须以此为准,不要根据聊天记录猜测):\n${descs.map((d, i) => `图片${i + 1}:${d}`).join('\n')}`;
+          log(`[群${s.groupId}] 已识别 ${descs.length} 张图片: ${descs[0].slice(0, 40)}`);
+        }
+      }
+
       log(`[trace][群${s.groupId}] 开始生成回复 reason=${reason} 历史${s.history.length}条`);
       const msgs = buildMessages(s);
+      // 图片描述钉进最后一条消息(模型对最后消息服从度最高)
+      if (visionCtx) msgs[msgs.length - 1].content += visionCtx;
       // 时间类问题:把准确时间钉进最后一条消息(模型对最后消息服从度最高),并提示可用工具
       let timeDirective = '';
       if (/几点|几点了|现在时间|当前时间|什么时间|日期|几月几号|星期几|今天周几|今天几号|什么日子/.test(ev.text)) {
@@ -282,7 +303,7 @@ export function createBrain(config, llm, api) {
       }
       // 对方直接跟机器人说话时,AI 可自主决定调用工具(搜索/天气/时间)
       let reply = await llm.chat(msgs, {
-        extraSystem: extra + techHint,
+        extraSystem: extra + techHint + visionCtx,
         maxTokens: isTech ? 1500 : undefined,
         tools: addressed,
       });

@@ -6,6 +6,7 @@
 import { loadConfig, log } from './config.mjs';
 import { createLLM, probeLLM } from './llm.mjs';
 import { createBrain } from './brain.mjs';
+import { cleanupImages } from './vlm.mjs';
 
 const config = loadConfig();
 const GATEWAY = `http://127.0.0.1:${process.env.GATEWAY_PORT || 3211}`;
@@ -29,9 +30,23 @@ const api = {
   getGroupInfo() {
     return Promise.resolve({});
   },
+  // 通用 OneBot API(经网关代理)
+  call(action, params) {
+    return fetch(`${GATEWAY}/api`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, params }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (!d.ok) throw new Error(d.error || 'API失败');
+        return d.data;
+      });
+  },
 };
 
 const brain = createBrain(config, llm, api);
+let selfIdSet = false;
 
 async function getSelfId() {
   try {
@@ -46,6 +61,15 @@ async function getSelfId() {
 /** 长轮询拉取事件并处理 */
 async function poll() {
   while (true) {
+    // 若还没拿到 selfId(网关重启过等情况),轮询时自动补拿
+    if (!selfIdSet) {
+      const sid = await getSelfId();
+      if (sid) {
+        brain.setSelfId(sid);
+        selfIdSet = true;
+        log(`已获取机器人 QQ: ${sid}`);
+      }
+    }
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 30000);
@@ -57,6 +81,7 @@ async function poll() {
           brain.onGroupMessage(ev, ev.raw);
         }
       }
+      cleanupImages();
     } catch {
       // 网关暂不可用,等 3 秒重试
       await sleep(3000);
